@@ -66,6 +66,11 @@ var (
 func main() {
 	config := parseFlags()
 
+	// Set up zombie reaping if we're PID 1
+	if os.Getpid() == 1 {
+		go setupPID1Handler()
+	}
+
 	// Initial certificate extraction
 	if err := extractAndWriteCertificates(config, true); err != nil {
 		if config.wait && (strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no such file")) {
@@ -446,8 +451,9 @@ func forwardSignals() {
 	signal.Notify(sigChan)
 
 	for sig := range sigChan {
-		// Don't forward SIGCHLD
+		// Handle SIGCHLD by reaping zombies
 		if sig == syscall.SIGCHLD {
+			reapZombies()
 			continue
 		}
 
@@ -456,6 +462,34 @@ func forwardSignals() {
 			childProcess.Process.Signal(sig)
 		}
 		childMutex.Unlock()
+	}
+}
+
+// reapZombies reaps all zombie processes when running as PID 1
+func reapZombies() {
+	for {
+		// Wait for any child process, non-blocking
+		pid, err := syscall.Wait4(-1, nil, syscall.WNOHANG, nil)
+		if err != nil || pid <= 0 {
+			// No more zombies to reap
+			break
+		}
+		// Log if it wasn't our managed child
+		childMutex.Lock()
+		if childProcess != nil && childProcess.Process != nil && pid != childProcess.Process.Pid {
+			log.Printf("Reaped zombie process %d", pid)
+		}
+		childMutex.Unlock()
+	}
+}
+
+// setupPID1Handler sets up SIGCHLD handling for PID 1 responsibilities
+func setupPID1Handler() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGCHLD)
+
+	for range sigChan {
+		reapZombies()
 	}
 }
 
